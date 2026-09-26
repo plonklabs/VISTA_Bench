@@ -1,0 +1,124 @@
+# One VISTA run: an agent builds one task's app on this runner, the grader
+# scores it, and the run's logs are kept as an artifact. `arm` is which agent:
+# `claude` is one Claude Code session, as the leaderboard runs it; `fleet` is
+# the same binary driven by fleet (not wired yet). A dispatch is one run; the
+# nightly rotation is the same job on a cron.
+name: vista
+
+on:
+  workflow_dispatch:
+    inputs:
+      task:
+        description: "task directory under tasks/c4"
+        default: "4_forum"
+        type: string
+      arm:
+        description: "claude | fleet"
+        default: "claude"
+        type: string
+      model:
+        description: "model id, pinned so the run is comparable"
+        default: "claude-sonnet-4-6"
+        type: string
+      variant:
+        description: "spec condition"
+        default: "c4"
+        type: string
+
+concurrency:
+  group: vista-docker-host
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: prod-dind
+    timeout-minutes: 150
+    env:
+      TASK: ${{ inputs.task }}
+      ARM: ${{ inputs.arm }}
+      MODEL: ${{ inputs.model }}
+      VARIANT: ${{ inputs.variant }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tools the harness and the grader need
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq rsync python3-pip python3-venv >/dev/null
+          python3 -m venv .venv
+          . .venv/bin/activate
+          pip install -q playwright Pillow
+          python3 -m playwright install --with-deps chromium >/dev/null
+          docker version --format 'docker {{.Server.Version}}'
+          docker compose version
+          claude --version
+          echo "CLAUDE_BIN=$(command -v claude)" >> "$GITHUB_ENV"
+
+      - name: Build the app
+        timeout-minutes: 120
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # The harness masks its own source tree from the agent with
+          # sandbox-exec or bwrap; neither runs inside this container, and the
+          # tree is public, so directory-only isolation is accepted.
+          ALLOW_UNSANDBOXED_EVAL: "1"
+        run: |
+          set -euo pipefail
+          . .venv/bin/activate
+          [ "$ARM" = claude ] || { echo "arm '$ARM' is not wired yet" >&2; exit 1; }
+          cd tasks
+          ./run_eval.sh --cli claude --task "$TASK" --variant "$VARIANT" --model "$MODEL"
+
+      - name: Score it
+        timeout-minutes: 30
+        run: |
+          set -euo pipefail
+          . .venv/bin/activate
+          cd tasks
+          FILTER="*${TASK}*" ./eval_all_runs.sh "$PWD/_runs"
+          echo "## $ARM · $TASK · $MODEL" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          cat _runs/eval_summary.csv >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Count the tokens
+        if: always()
+        run: |
+          set -euo pipefail
+          python3 - "$GITHUB_STEP_SUMMARY" <<'PY'
+          import json, sys, glob
+          out = open(sys.argv[1], "a")
+          for path in sorted(glob.glob("tasks/_runs/*/logs/events.jsonl")):
+              usage = {}; cost = None; turns = None; ms = None
+              for line in open(path):
+                  try: e = json.loads(line)
+                  except ValueError: continue
+                  if e.get("type") == "result":
+                      usage = e.get("usage") or {}; cost = e.get("total_cost_usd")
+                      turns = e.get("num_turns"); ms = e.get("duration_ms")
+              total = sum(v for k, v in usage.items() if isinstance(v, (int, float)))
+              print(f"\n**tokens** `{path.split('/')[2]}`: total {total:,} "
+                    f"(input {usage.get('input_tokens',0):,}, cache read {usage.get('cache_read_input_tokens',0):,}, "
+                    f"cache write {usage.get('cache_creation_input_tokens',0):,}, output {usage.get('output_tokens',0):,}); "
+                    f"cost ${cost}; turns {turns}; {None if ms is None else round(ms/60000,1)} min", file=out)
+          PY
+
+      - name: Tear down
+        if: always()
+        run: |
+          docker ps -q | xargs -r docker rm -f >/dev/null 2>&1 || true
+          docker network prune -f >/dev/null 2>&1 || true
+
+      - name: Keep the run
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vista-${{ inputs.arm }}-${{ inputs.task }}-${{ github.run_id }}
+          path: |
+            tasks/_runs/**
+            !tasks/_runs/**/node_modules/**
+            !tasks/_runs/**/.next/**
+          if-no-files-found: warn
+          retention-days: 30

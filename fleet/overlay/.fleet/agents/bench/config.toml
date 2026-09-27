@@ -1,0 +1,47 @@
+# The one member of a benchmark run: who it is, and what it runs. The policy
+# it works under is the team file two directories up; a policy key written
+# here is an error naming the key, so the two never disagree.
+
+[tick]
+timer = 15
+refresh_window = 30
+snooze = "15m"
+
+[sessions]
+# How long a session may go without a tick before the render puts its dag's
+# run line back in front of the root.
+stale = "20m"
+# How many sessions this member runs at once. It is a fairness knob and it is
+# reported with the run: the other arm is one session, and this is how many
+# this one is allowed. `[resources] compose` in the team file matches it.
+max = 2
+
+# The label this member owns its items under. Plain ASCII, because the
+# throwaway repository is created by a script and a label is one more thing
+# that has to round-trip through it.
+[issues]
+label = "bench"
+
+[root]
+# The harness's own definition of a session: `.claude/agents/worker.md`, which
+# the overlay ships beside this file. The argv fleet starts a session with is
+# fleet's own and not configurable, and it passes `--agent worker`.
+agent = "worker"
+# A session with no person to ask cannot stop for a permission prompt.
+permissions = "bypass"
+
+# What this member's harness runs each tier as. All four are the same model,
+# pinned, so no step of any template escapes the arm's own pin — a benchmark
+# comparing one model under fleet against the same model in one session has no
+# meaning if a heavy step silently runs something else.
+#
+# The value below is not a model id. Fleet reads no environment variable here,
+# so the runner rewrites all four lines before `fleet init`, from the same
+# `--model` the other arm is given. A run that forgets fails at the first
+# spawn, which is the failure this placeholder is for: a wrong model that ran
+# is worse than a run that did not start.
+[tiers.claude]
+heavy = "MODEL-PINNED-BY-THE-RUNNER"
+light = "MODEL-PINNED-BY-THE-RUNNER"
+mechanical = "MODEL-PINNED-BY-THE-RUNNER"
+analysis = "MODEL-PINNED-BY-THE-RUNNER"

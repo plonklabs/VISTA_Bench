@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+# The landing lane's rebase, run in the checkout the dag made for itself.
+#
+# `run("rebase")` hands the dag, its facts and its params as one JSON object on
+# stdin and reads an exit code and one line of `{"ok", "facts"}` back. Every
+# key of `facts` becomes `script.rebase.<key>`; the `head` it prints is the
+# commit it left the branch at, and it is the head the pull request is read at
+# for the rest of that pass.
+#
+# Nothing is run on the rebased head here. The repository's one receipt is the
+# `check` workflow, which fires on the push of its own accord, and the merge
+# step waits for it to be green at the head that lands.
+#
+# A conflict is not this script's to settle. The rebase is aborted so the
+# checkout is left where a session can work in it, and the reason names the
+# files git stopped on — which is the sentence the repository's judge rule
+# about this step matches on.
+set -euo pipefail
+
+# A reason is one line in the ledger, and it travels inside a JSON string.
+one_line() {
+    printf '%s' "$1" | tr -d '"\\' | tr '\n' ' '
+}
+
+say_no() {
+    printf '{"ok": false, "reason": "%s"}\n' "$(one_line "$1")"
+    exit 1
+}
+
+# A refusal that did nothing, which is not a try the step spent: the guard read
+# the world and declined on what it read, so the step holds and reads again on
+# the next pass. Only for a reading a later pass can answer on its own.
+say_moved() {
+    printf '{"ok": false, "moved": true, "reason": "%s"}\n' "$(one_line "$1")"
+    exit 1
+}
+
+# The first match, not the last: the dag is the first half of the object and a
+# fact's own value can carry the same text further down.
+input=$(cat)
+at=$(printf '%s' "$input" | grep -o '"workspace.path":"[^"]*"' | head -1 | cut -d'"' -f4)
+[ -n "$at" ] || say_no "the dag cut no checkout, and a rebase runs in one"
+
+root=$(git rev-parse --show-toplevel)
+tree="$root/$at"
+[ -d "$tree" ] || say_no "the dag names $at, and there is no checkout there"
+
+branch=$(git -C "$tree" symbolic-ref --quiet --short HEAD || true)
+[ -n "$branch" ] || say_no "$at stands on no branch"
+[ -z "$(git -C "$tree" status --porcelain)" ] ||
+    say_no "$at is dirty, and a rebase would carry the change into what lands"
+
+before=$(git -C "$tree" rev-parse HEAD)
+
+default=$(git -C "$tree" rev-parse --abbrev-ref origin/HEAD)
+default=${default#origin/}
+
+# Both refs: the default to rebase onto, and the branch so what origin carries
+# for it can be read. The push below leases against the commit this checkout
+# started from rather than against a tracking ref this fetch just refreshed.
+out=$(git -C "$tree" fetch --quiet origin \
+    "+refs/heads/$default:refs/remotes/origin/$default" \
+    "+refs/heads/$branch:refs/remotes/origin/$branch" 2>&1) ||
+    say_no "origin carries neither $default nor $branch where $at expects them: $(printf '%s' "$out" | tail -3)"
+
+remote=$(git -C "$tree" rev-parse "origin/$branch")
+
+# Which way they differ decides who can settle it. Origin an ancestor of this
+# head is a push that has not arrived: nothing origin carries would be lost,
+# and the push landing is what answers it. Anything else is origin carrying
+# commits this checkout has not got, where the force-push would drop somebody's.
+if [ "$before" != "$remote" ]; then
+    if git -C "$tree" merge-base --is-ancestor "$remote" "$before"; then
+        say_moved "$at is at ${before:0:9} and origin/$branch at ${remote:0:9}, and origin has not got what this checkout carries yet"
+    fi
+    say_no "$at is at ${before:0:9} and origin/$branch at ${remote:0:9}, and a rebase here would push over what origin carries"
+fi
+
+if ! git -C "$tree" rebase --quiet "origin/$default" >/dev/null 2>&1; then
+    stopped=$(git -C "$tree" diff --name-only --diff-filter=U | tr '\n' ' ')
+    git -C "$tree" rebase --abort >/dev/null 2>&1 || true
+    say_no "$branch conflicts with origin/$default in: ${stopped:-files git did not name}"
+fi
+
+out=$(git -C "$tree" push --quiet --force-with-lease="$branch:$before" origin \
+    "HEAD:refs/heads/$branch" 2>&1) ||
+    say_no "$branch moved on origin while it was being rebased, or the push did not get through: $(printf '%s' "$out" | tail -3)"
+
+printf '{"ok": true, "facts": {"head": "%s", "onto": "origin/%s"}}\n' \
+    "$(git -C "$tree" rev-parse HEAD)" "$default"

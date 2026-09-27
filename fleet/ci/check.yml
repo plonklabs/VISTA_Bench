@@ -1,0 +1,111 @@
+# The one check a throwaway benchmark repository runs. It is what every fact
+# fleet reads about a head comes from: `main.green` on the default branch,
+# `pr.checks.green` on a pull request. There is no second workflow, so a head
+# is green exactly when this job passed on it.
+#
+# What it proves is the C4 contract's own cold start: `docker compose up
+# --build` from nothing, then every URL in the README's `## Pages` table
+# answering 200. That is the same reading the grader takes, so a green here
+# is the app the submission is scored on.
+name: check
+
+on:
+  push:
+    branches: ["**"]
+  workflow_dispatch:
+
+# One compose stack at a time on this host. The grader binds the same pair,
+# and a second stack coming up under it would take the ports out from
+# underneath a run that is being scored.
+concurrency:
+  group: check-compose-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: prod-dind
+    timeout-minutes: 30
+    env:
+      # The host port the task description told the app to expose. The pair is
+      # the grader's; nothing else on this host may take it while a run is
+      # standing, which is what the concurrency group above is for.
+      FRONTEND_PORT: ${{ vars.FRONTEND_PORT || '38000' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: The compose file and the Pages table are both there
+        run: |
+          set -euo pipefail
+          test -f docker-compose.yml || test -f compose.yml || {
+            echo "no docker-compose.yml at the repository root" >&2; exit 1; }
+          grep -q '^## Pages' README.md || {
+            echo "README.md carries no '## Pages' section" >&2; exit 1; }
+
+      - name: Cold start
+        timeout-minutes: 20
+        run: |
+          set -euo pipefail
+          [ -f .env ] || { [ -f .env.example ] && cp .env.example .env; } || true
+          docker compose down -v --remove-orphans >/dev/null 2>&1 || true
+          docker compose up --build -d
+          docker compose ps
+
+      - name: Every page in the README answers
+        timeout-minutes: 10
+        run: |
+          set -euo pipefail
+          base="http://localhost:${FRONTEND_PORT}"
+
+          # The `## Pages` table, second column, header and rule dropped: the
+          # C4 contract pins the columns as `Page #` and `URL`, and a concrete
+          # sample URL rather than a route pattern.
+          urls=$(awk '
+            /^## Pages/        { inside = 1; next }
+            inside && /^## /   { inside = 0 }
+            inside && /^\|/ {
+              split($0, cell, "|")
+              url = cell[3]
+              gsub(/^[ \t]+|[ \t]+$/, "", url)
+              gsub(/`/, "", url)
+              if (url ~ /^\//) print url
+            }
+          ' README.md)
+
+          [ -n "$urls" ] || { echo "the '## Pages' table names no URL" >&2; exit 1; }
+
+          # The app is still building its first response on a cold start, so
+          # the root is waited for before the table is walked. Five minutes,
+          # counted, and it prints what it last saw when it runs out.
+          code=000
+          for _ in $(seq 1 60); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$base/" || echo 000)
+            case "$code" in 2*|3*) break ;; esac
+            sleep 5
+          done
+          case "$code" in
+            2*|3*) ;;
+            *)
+              echo "the app never answered at $base/ (last: $code)" >&2
+              docker compose logs --tail=80 >&2
+              exit 1
+              ;;
+          esac
+
+          failed=0
+          while IFS= read -r url; do
+            code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 "$base$url" || echo 000)
+            printf '%s  %s\n' "$code" "$url"
+            case "$code" in 2*|3*) ;; *) failed=1 ;; esac
+          done <<< "$urls"
+
+          [ "$failed" -eq 0 ] || {
+            echo "a page in the README's '## Pages' table did not answer" >&2
+            docker compose logs --tail=80 >&2
+            exit 1
+          }
+
+      - name: Tear down
+        if: always()
+        run: |
+          docker compose down -v --remove-orphans >/dev/null 2>&1 || true
+          docker network prune -f >/dev/null 2>&1 || true

@@ -1,0 +1,8 @@
+# The fleet's own per-environment state and the checkouts its dags cut. Neither
+# belongs in the tree the benchmark is graded on.
+#
+# Nothing else is listed. The C4 contract wants a default `.env` committed so a
+# cold start succeeds, and whatever else the chosen framework ignores is that
+# framework's scaffold to add.
+.fleet/local/
+worktrees/

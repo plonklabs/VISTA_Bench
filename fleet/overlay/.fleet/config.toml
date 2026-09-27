@@ -1,0 +1,150 @@
+# The team file for a throwaway benchmark repository: one member, one item,
+# one application, nobody in the loop. Everything here is chosen for a run
+# with no person to answer a question — where the fleet's own default would
+# stop and ask, this file either settles it in advance or accepts that the
+# dag parks and the run is graded on whatever `main` holds.
+
+# Bare keys before the first table header, or TOML files them under whichever
+# table was opened last. Three comebacks, because the whole run is bounded by
+# the benchmark's deadline rather than by anyone's patience.
+attempts = 3
+timeout = "4h"
+retries = 3
+
+[tiers]
+default = "heavy"
+
+# The rule stays as fleet ships it: no work starts under a branch nobody has
+# looked at. It is what makes the seed run of `check` on the default branch a
+# precondition of the first dag rather than a nicety — with no run at that
+# head, neither `main.green` nor `main.pending` holds and `admit` never
+# passes.
+[templates]
+must_depend_on = ["main.green"]
+except = ["main", "init", "analysis"]
+
+# The item is created by hand — `fleet dag create implement --issue <n>` — so
+# `ready` and `hold` decide nothing in a normal run. They are named because
+# `intake` reads them, and a run that turns intake on gets the same vocabulary
+# rather than inventing one under time pressure.
+[issues]
+provider = "github"
+ready = "ready"
+hold = "hold"
+
+# There is no review bot in this organisation, so no login speaks for a round.
+# Left empty on purpose: the `pr` source then skips the review read entirely,
+# and the `implement` template carries no step that waits for a verdict
+# nothing will post.
+[review]
+bots = []
+check = ""
+marker = ""
+blockers = []
+ceiling = ""
+
+[tick]
+in_flight = 4
+refresh_window = 30
+
+# The pools a step's `holds` may name.
+#
+# `landing` is one: two branches merging at once put each other behind a base
+# that moved and both pay for it twice.
+#
+# `compose` is how many `docker compose` stacks may stand on this host at
+# once. It is a count and nothing more — a pool cannot hand its holder which
+# unit it got — so which host ports a session takes is derived in the session
+# from the checkout it works in, and this only bounds how many stacks are up.
+# It matches `[sessions] max`, so the bound binds when that is raised.
+[resources]
+landing = 1
+compose = 2
+
+# Where a line of work's checkout goes. Left at fleet's own default and
+# written out so the throwaway repository's `.gitignore` and this agree.
+[workspace]
+root = "worktrees/{lineage}"
+
+# The judges a stop is put to, in order. `rules` costs nothing — no session,
+# no call, no person — so it goes first; the engine answers what no rule
+# names.
+[judge]
+chain = ["rules", "systemone"]
+hydration = "dag"
+
+[judge.systemone]
+url = "https://api.typesafe.ai/v1/systemone"
+model = "jev-1.13.0"
+# Named, never carried: this file is checked into a public repository and the
+# value lives in the environment of whatever starts the root. `fleet up`
+# refuses to start when the variable is absent rather than failing every call
+# one at a time.
+key_env = "JEV_KEY"
+breaker = { failures = 3, window = "5m" }
+
+[judge.policy]
+act_at = 0.80
+ask_below = 0.30
+# Retiring ends the work the item exists for and advancing walks the dag past
+# a step whose work nobody did. With nobody to confirm either, both park —
+# which is the right answer: a run graded on a `main` that was advanced past
+# its own build is not a result.
+never_alone = ["retire", "advance"]
+# Three rather than plonk's one. There is nobody to spend the fourth stop's
+# attention on, so the choice is between a judged move and a parked dag, and a
+# parked dag is a zero.
+moves_per_dag = 3
+
+# The rebase this fleet runs is the one step whose two failures are told apart
+# by the text of the reason and by nothing a gate could have read first.
+#
+# A transport's own words for a call that did not get through: none of them is
+# something a diff, a gate or a conflict says, so a reason carrying one is a
+# failure that came from outside the change.
+[[judge.rules]]
+then = "retry"
+when.all = [
+    { template = "implement" },
+    { node = "rebase" },
+    { any = [
+        { reason_matches = "returned error: 502" },
+        { reason_matches = "returned error: 503" },
+        { reason_matches = "connection reset by peer" },
+        { reason_matches = "the remote end hung up unexpectedly" },
+        { reason_matches = "could not resolve host" },
+    ] },
+]
+
+# The other side of the same step: a rebase git stopped on is coding work, and
+# the checkout is left clean where a session can do it. Bounded to the one
+# sentence `.fleet/actions/rebase` writes when git stopped on a conflict.
+[[judge.rules]]
+then = "rewind:build"
+when.all = [
+    { template = "implement" },
+    { node = "rebase" },
+    { reason_matches = "conflicts with origin/" },
+]
+
+# A session that ran out of its own clock left the checkout where the next one
+# picks it up: the branch is cut, whatever it committed is committed, and a
+# second session carries it on. This is the stop a long unattended build hits
+# most, and the one a parked dag costs the most.
+[[judge.rules]]
+then = "retry"
+when.all = [
+    { template = "implement" },
+    { node = "build" },
+    { reason_matches = "timed out" },
+]
+
+# The same for the round: a review round that ran out of time has read part of
+# the app, and the next session reads the rest.
+[[judge.rules]]
+then = "retry"
+when.all = [
+    { template = "implement" },
+    { node = "self-review" },
+    { reason_matches = "timed out" },
+]
